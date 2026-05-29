@@ -27,22 +27,13 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies including Chrome and virtual display
+# Install system dependencies. (Job descriptions are fetched via Seek's GraphQL
+# API, so no browser/Chromium/Xvfb is needed.)
 RUN apt-get update && apt-get install -y \
     gcc \
     libxml2-dev \
     libxslt-dev \
     curl \
-    wget \
-    gnupg \
-    xvfb \
-    xauth \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Chromium (works on both amd64 and arm64)
-RUN apt-get update && apt-get install -y \
-    chromium \
-    chromium-driver \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Python project files
@@ -69,10 +60,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install additional pipeline requirements
 RUN pip install --no-cache-dir \
     python-dateutil \
-    pandas \
-    undetected-chromedriver \
-    selenium \
-    pyvirtualdisplay
+    pandas
 
 # Create directories for data and logs
 RUN mkdir -p /app/data /app/logs

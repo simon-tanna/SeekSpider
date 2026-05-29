@@ -21,6 +21,13 @@ from plombery.pipeline.context import run_context
 # Global dictionary to track running processes by run_id
 _running_processes: Dict[int, asyncio.subprocess.Process] = {}
 
+# Only one backfill may run at a time. Many per-region triggers fire close
+# together; without this guard they pile up into redundant concurrent runs
+# hammering the same API and database. Concurrent triggers skip instead of
+# stacking. Safe to check-and-set without a lock: asyncio is single-threaded
+# and there is no await between the check and the assignment.
+_backfill_active: bool = False
+
 # Hard timeouts to prevent hung subprocesses from holding FDs/PIDs indefinitely.
 # Tuned to comfortably exceed observed run durations while still bounding leaks.
 SPIDER_TIMEOUT_SECONDS = 10800     # 3h — scrapy crawl one region, all subclasses
@@ -462,13 +469,13 @@ class BackfillParams(BaseModel):
     )
     headless: bool = Field(
         default=False,
-        description="Run browser in headless mode (default: False for better success rate)"
+        description="Deprecated/ignored. Backfill no longer uses a browser (fetches via GraphQL)."
     )
     workers: int = Field(
-        default=3,
+        default=2,
         ge=1,
         le=5,
-        description="Number of concurrent workers (1-5, default: 3)"
+        description="Number of concurrent worker threads (1-5, default: 2)."
     )
     region: Optional[REGIONS] = Field(
         default=None,
@@ -486,7 +493,7 @@ class BackfillParams(BaseModel):
         default=30,
         ge=5,
         le=100,
-        description="Restart Chrome driver every N jobs (only for serial mode)"
+        description="Deprecated/ignored. Backfill no longer uses a browser driver."
     )
 
 
@@ -497,12 +504,26 @@ async def run_backfill(params: BackfillParams) -> dict:
     logger = get_logger()
     logger.info("Starting Backfill Job Descriptions")
     logger.info(f"Parameters: limit={params.limit}, delay={params.delay}, workers={params.workers}")
-    logger.info(f"Region filter: {params.region or 'All regions'}")
-    logger.info(f"Headless mode: {params.headless}, Include inactive: {params.include_inactive}")
+    logger.info(f"Region filter: {params.region or 'All regions'}, Include inactive: {params.include_inactive}")
 
     # Get current run_id from context
     pipeline_run = run_context.get()
     run_id = pipeline_run.id if pipeline_run else None
+
+    # Skip if another backfill is already running, to avoid redundant
+    # concurrent runs hammering the same API / database.
+    global _backfill_active
+    if _backfill_active:
+        logger.warning(
+            "Another backfill is already running; skipping this trigger to avoid pile-up."
+        )
+        return {
+            "status": "skipped",
+            "message": "Another backfill already running",
+            "region": params.region or "All regions",
+            "timestamp": datetime.now().isoformat(),
+        }
+    _backfill_active = True
 
     process = None
     try:
@@ -519,15 +540,11 @@ async def run_backfill(params: BackfillParams) -> dict:
 
         cmd.extend(['--delay', str(params.delay)])
         cmd.extend(['--workers', str(params.workers)])
-        cmd.extend(['--restart-interval', str(params.restart_interval)])
 
         if params.region:
             # Use region for both output organization and filtering
             cmd.extend(['--region', params.region])
             cmd.extend(['--region-filter', params.region])
-
-        if params.headless:
-            cmd.append('--headless')
 
         if params.include_inactive:
             cmd.append('--include-inactive')
@@ -615,6 +632,8 @@ async def run_backfill(params: BackfillParams) -> dict:
         }
 
     finally:
+        # Release the backfill slot so the next trigger can run.
+        _backfill_active = False
         # Always unregister the process
         if run_id and run_id in _running_processes:
             del _running_processes[run_id]

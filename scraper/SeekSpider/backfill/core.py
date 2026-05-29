@@ -1,5 +1,8 @@
 """
 Core backfill functionality - JobDescriptionBackfiller class.
+
+Job descriptions are fetched from Seek's GraphQL API (see fetcher.py), which
+bypasses the Cloudflare-protected HTML job page. No browser is involved.
 """
 
 import csv
@@ -11,15 +14,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Tuple, Optional
 
+import requests
 from bs4 import BeautifulSoup
 
 from .config import BackfillConfig
-from .drivers import DriverManager
+from .fetcher import fetch_job_detail, TRANSIENT_STATUSES
 from .ai_processor import BackfillAIProcessor
 
 
 class JobDescriptionBackfiller:
-    """Backfill missing job descriptions using Chrome browser automation"""
+    """Backfill missing job descriptions via Seek's GraphQL API"""
 
     def __init__(self, config: BackfillConfig = None, logger: logging.Logger = None):
         self.config = config or BackfillConfig()
@@ -27,18 +31,15 @@ class JobDescriptionBackfiller:
 
         self.logger = logger or logging.getLogger('backfill')
 
-        # Initialize managers
-        self.driver_manager = DriverManager(self.config, self.logger)
+        # Managers
         self.ai_processor = BackfillAIProcessor(self.config, self.logger)
+
+        # HTTP session shared across requests (connection pooling).
+        self.session = requests.Session()
 
         # Database connection
         self.db = None
         self._init_database()
-
-        # Driver state (for serial mode)
-        self.driver = None
-        self.jobs_since_restart = 0
-        self.consecutive_failures = 0
 
         # Thread safety locks
         self.db_lock = threading.Lock()
@@ -54,8 +55,7 @@ class JobDescriptionBackfiller:
             'total': 0,
             'success': 0,
             'failed': 0,
-            'cloudflare_blocked': 0,
-            'driver_restarts': 0,
+            'no_description': 0,
         }
 
     def _init_database(self):
@@ -99,7 +99,7 @@ class JobDescriptionBackfiller:
     def run(self, limit: int = None):
         """Run the backfill process"""
         self.logger.info("=" * 60)
-        self.logger.info("Starting job description backfill...")
+        self.logger.info("Starting job description backfill (GraphQL API)...")
 
         region_msg = f"for region: {self.config.region_filter}" if self.config.region_filter else "for all regions"
         limit_msg = f"up to {limit}" if limit else "all"
@@ -147,284 +147,91 @@ class JobDescriptionBackfiller:
 
     def _run_serial(self, jobs: List[Tuple]):
         """Run backfill in serial mode"""
-        self.driver = self.driver_manager.create_driver()
+        for i, (job_id, url, title) in enumerate(jobs, 1):
+            self.logger.info(f"[{i}/{len(jobs)}] Processing job {job_id}: {title[:50]}...")
+            self._process_job(job_id, url, title)
 
-        try:
-            for i, (job_id, url, title) in enumerate(jobs, 1):
-                self.logger.info(f"[{i}/{len(jobs)}] Processing job {job_id}: {title[:50]}...")
-
-                # Check for periodic restart
-                self._periodic_restart_check()
-
-                description, suburb, status = self._fetch_with_retry(url)
-
-                if status == 'cloudflare':
-                    self.logger.warning("  Cloudflare blocked - skipping")
-                    self.stats['cloudflare_blocked'] += 1
-                    self.consecutive_failures += 1
-                    time.sleep(self.config.delay * 2)
-
-                    if self.consecutive_failures >= self.config.max_consecutive_failures:
-                        self.logger.warning(f"  {self.consecutive_failures} consecutive failures, restarting driver...")
-                        self._restart_driver("consecutive failures")
-                    continue
-
-                if status == 'success' and description:
-                    self.consecutive_failures = 0
-                    text_only = BeautifulSoup(description, 'lxml').get_text()[:100].replace('\n', ' ').strip()
-                    self.logger.info(f"  Description preview: {text_only}...")
-
-                    if self._update_job(job_id, description, suburb):
-                        self.logger.info(f"  Updated successfully (description: {len(description)} chars, suburb: {suburb})")
-                        self.stats['success'] += 1
-                        self._write_csv_row(job_id, title, url, suburb, description)
-
-                        text_description = BeautifulSoup(description, 'lxml').get_text(separator=' ').strip()
-                        self.ai_processor.queue_analysis(job_id, text_description)
-                    else:
-                        self.stats['failed'] += 1
-                        self.consecutive_failures += 1
-                else:
-                    self.logger.warning(f"  Failed: {status}")
-                    self.stats['failed'] += 1
-                    self.consecutive_failures += 1
-
-                    if self.consecutive_failures >= self.config.max_consecutive_failures:
-                        self.logger.warning(f"  {self.consecutive_failures} consecutive failures, restarting driver...")
-                        self._restart_driver("consecutive failures")
-
-                self.jobs_since_restart += 1
-                delay = self.config.delay + random.uniform(0, 2)
-                time.sleep(delay)
-
-        finally:
-            DriverManager.close_driver(self.driver)
-            self.driver_manager.stop_virtual_display()
+            # Polite delay between requests.
+            time.sleep(self.config.delay + random.uniform(0, 1))
 
     def _run_concurrent(self, jobs: List[Tuple]):
-        """Run backfill in concurrent mode with multiple workers"""
-        self.logger.info(f"Initializing {self.config.workers} Chrome driver instances...")
+        """Run backfill in concurrent mode with multiple worker threads"""
+        self.logger.info(f"✓ {self.config.workers} workers ready for concurrent processing")
 
-        drivers = []
-        for i in range(self.config.workers):
-            try:
-                driver = self.driver_manager.create_driver()
-                drivers.append(driver)
-                self.logger.info(f"  Worker {i+1}/{self.config.workers} initialized")
-            except Exception as e:
-                self.logger.error(f"  Failed to initialize worker {i+1}: {e}")
+        with ThreadPoolExecutor(max_workers=self.config.workers, thread_name_prefix='Worker') as executor:
+            futures = []
+            for i, (job_id, url, title) in enumerate(jobs, 1):
+                future = executor.submit(self._process_single_job, (job_id, url, title), i, len(jobs))
+                futures.append(future)
+                # Small stagger so requests don't all fire on the same instant.
+                time.sleep(min(self.config.delay, 1.0) / self.config.workers)
 
-        if not drivers:
-            self.logger.error("Failed to initialize any drivers, falling back to serial mode")
-            self._run_serial(jobs)
-            return
-
-        self.logger.info(f"✓ {len(drivers)} workers ready for concurrent processing")
-
-        try:
-            with ThreadPoolExecutor(max_workers=len(drivers), thread_name_prefix='Worker') as executor:
-                futures = []
-                for i, job_data in enumerate(jobs, 1):
-                    driver_index = (i - 1) % len(drivers)
-                    driver_instance = drivers[driver_index]
-
-                    future = executor.submit(
-                        self._process_single_job,
-                        job_data,
-                        i,
-                        len(jobs),
-                        driver_instance
-                    )
-                    futures.append(future)
-                    time.sleep(0.5)
-
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        self.logger.error(f"Worker error: {e}")
-
-        finally:
-            self.logger.info("Cleaning up driver instances...")
-            for i, driver in enumerate(drivers):
+            for future in as_completed(futures):
                 try:
-                    DriverManager.close_driver(driver)
-                    self.logger.info(f"  Worker {i+1} driver closed")
+                    future.result()
                 except Exception as e:
-                    self.logger.error(f"  Error closing worker {i+1}: {e}")
+                    self.logger.error(f"Worker error: {e}")
 
-            self.driver_manager.stop_virtual_display()
-
-    def _process_single_job(self, job_data: Tuple, job_index: int, total_jobs: int, driver_instance) -> bool:
+    def _process_single_job(self, job_data: Tuple, job_index: int, total_jobs: int) -> bool:
         """Process a single job (used for concurrent execution)"""
         job_id, url, title = job_data
-        self.logger.info(f"[{job_index}/{total_jobs}] [Worker-{threading.current_thread().name}] Processing job {job_id}: {title[:50]}...")
+        worker = threading.current_thread().name
+        self.logger.info(f"[{job_index}/{total_jobs}] [Worker-{worker}] Processing job {job_id}: {title[:50]}...")
+        return self._process_job(job_id, url, title, worker=worker)
 
-        description, suburb, status = self._fetch_with_retry_concurrent(url, driver_instance)
+    def _process_job(self, job_id, url, title, worker: str = None) -> bool:
+        """Fetch one job description and persist it. Returns True on success."""
+        prefix = f"  [Worker-{worker}]" if worker else " "
 
-        if status == 'cloudflare':
-            self.logger.warning(f"  [Worker-{threading.current_thread().name}] Cloudflare blocked - skipping")
-            self.stats['cloudflare_blocked'] += 1
-            return False
+        description, suburb, status = self._fetch_with_retry(job_id)
 
-        if status == 'success' and description:
-            text_only = BeautifulSoup(description, 'lxml').get_text()[:100].replace('\n', ' ').strip()
-            self.logger.info(f"  [Worker-{threading.current_thread().name}] Description preview: {text_only}...")
-
-            if self._update_job(job_id, description, suburb):
-                self.logger.info(f"  [Worker-{threading.current_thread().name}] Updated successfully (description: {len(description)} chars, suburb: {suburb})")
-                self.stats['success'] += 1
-                self._write_csv_row(job_id, title, url, suburb, description)
-
-                text_description = BeautifulSoup(description, 'lxml').get_text(separator=' ').strip()
-                self.ai_processor.queue_analysis(job_id, text_description)
-                return True
+        if status != 'success' or not description:
+            if status == 'no_description':
+                self.stats['no_description'] += 1
             else:
                 self.stats['failed'] += 1
-                return False
-        else:
-            self.logger.warning(f"  [Worker-{threading.current_thread().name}] Failed: {status}")
-            self.stats['failed'] += 1
+            self.logger.warning(f"{prefix} Failed: {status}")
             return False
 
-    def _fetch_job_description(self, url: str, driver=None) -> Tuple[Optional[str], Optional[str], str]:
-        """Fetch job description from URL"""
-        driver = driver or self.driver
+        text_only = BeautifulSoup(description, 'lxml').get_text()[:100].replace('\n', ' ').strip()
+        self.logger.info(f"{prefix} Description preview: {text_only}...")
 
-        try:
-            driver.get(url)
-            time.sleep(3)
+        if self._update_job(job_id, description, suburb):
+            self.logger.info(f"{prefix} Updated successfully (description: {len(description)} chars, suburb: {suburb})")
+            self.stats['success'] += 1
+            self._write_csv_row(job_id, title, url, suburb, description)
 
-            # Check for Cloudflare challenge with improved detection
-            page_source = driver.page_source
-            cloudflare_indicators = [
-                'challenge',
-                'cf-browser-verification',
-                'cf-challenge',
-                'ray id',
-                'checking your browser',
-                'just a moment'
-            ]
-
-            is_cloudflare = any(indicator in page_source.lower() for indicator in cloudflare_indicators)
-
-            if is_cloudflare:
-                self.logger.warning("  Cloudflare challenge detected, waiting for resolution...")
-                # Wait longer and check multiple times
-                max_wait_attempts = 3
-                for attempt in range(max_wait_attempts):
-                    time.sleep(8)  # Increased wait time
-                    page_source = driver.page_source
-                    is_cloudflare = any(indicator in page_source.lower() for indicator in cloudflare_indicators)
-                    if not is_cloudflare:
-                        self.logger.info(f"  Cloudflare challenge resolved after {(attempt + 1) * 8} seconds")
-                        break
-                else:
-                    self.logger.warning("  Cloudflare challenge still present after waiting")
-                    return None, None, 'cloudflare_blocked'
-
-            soup = BeautifulSoup(page_source, 'lxml')
-
-            # Extract job description
-            job_details = soup.find("div", attrs={"data-automation": "jobAdDetails"})
-            if not job_details:
-                job_details = soup.find("div", attrs={"data-automation": "jobDescription"})
-            if not job_details:
-                job_details = soup.find("div", class_=lambda x: x and 'jobDescription' in str(x).lower())
-
-            description = str(job_details) if job_details else None
-
-            # Extract suburb
-            location = soup.find("span", attrs={"data-automation": "job-detail-location"})
-            suburb = location.text if location else None
-
-            return description, suburb, 'success' if description else 'no_description'
-
-        except Exception as e:
-            error_msg = str(e)
-            if 'timeout' in error_msg.lower():
-                return None, None, 'timeout'
-            if 'no such window' in error_msg.lower() or 'target window already closed' in error_msg.lower():
-                return None, None, 'driver_crashed'
-            return None, None, error_msg
-
-    def _fetch_with_retry(self, url: str) -> Tuple[Optional[str], Optional[str], str]:
-        """Fetch job description with retry logic (serial mode)"""
-        for attempt in range(self.config.max_job_retries + 1):
-            try:
-                if not DriverManager.is_driver_alive(self.driver):
-                    self._restart_driver("driver not responding")
-                    time.sleep(2)
-
-                description, suburb, status = self._fetch_job_description(url)
-
-                if status == 'driver_crashed':
-                    self.logger.warning(f"  Driver crashed (attempt {attempt + 1}/{self.config.max_job_retries + 1})")
-                    self._restart_driver("driver crashed")
-                    time.sleep(2)
-
-                    if attempt < self.config.max_job_retries:
-                        continue
-                    else:
-                        return None, None, 'max_retries_exceeded'
-
-                return description, suburb, status
-
-            except Exception as e:
-                self.logger.error(f"  Unexpected error (attempt {attempt + 1}): {e}")
-                if attempt < self.config.max_job_retries:
-                    self._restart_driver(f"exception: {e}")
-                    time.sleep(2)
-                else:
-                    return None, None, f'exception: {e}'
-
-        return None, None, 'max_retries_exceeded'
-
-    def _fetch_with_retry_concurrent(self, url: str, driver_instance) -> Tuple[Optional[str], Optional[str], str]:
-        """Fetch job description with retry logic (concurrent mode)"""
-        for attempt in range(self.config.max_job_retries + 1):
-            try:
-                description, suburb, status = self._fetch_job_description(url, driver_instance)
-
-                if status == 'driver_crashed':
-                    self.logger.warning(f"  Driver crashed (attempt {attempt + 1}/{self.config.max_job_retries + 1})")
-                    if attempt < self.config.max_job_retries:
-                        time.sleep(2)
-                        continue
-                    else:
-                        return None, None, 'max_retries_exceeded'
-
-                return description, suburb, status
-
-            except Exception as e:
-                self.logger.error(f"  Unexpected error (attempt {attempt + 1}): {e}")
-                if attempt < self.config.max_job_retries:
-                    time.sleep(2)
-                else:
-                    return None, None, f'exception: {e}'
-
-        return None, None, 'max_retries_exceeded'
-
-    def _restart_driver(self, reason: str = "unknown"):
-        """Restart the Chrome driver (serial mode)"""
-        self.logger.warning(f"  Restarting driver (reason: {reason})...")
-        self.stats['driver_restarts'] += 1
-
-        DriverManager.close_driver(self.driver)
-        time.sleep(2)
-
-        self.driver = self.driver_manager.create_driver()
-        self.jobs_since_restart = 0
-        self.consecutive_failures = 0
-        self.logger.info("  Driver restarted successfully")
-
-    def _periodic_restart_check(self):
-        """Check if driver should be restarted based on job count"""
-        if self.jobs_since_restart >= self.config.restart_interval:
-            self.logger.info(f"Periodic restart: processed {self.jobs_since_restart} jobs since last restart")
-            self._restart_driver(f"periodic restart after {self.config.restart_interval} jobs")
+            text_description = BeautifulSoup(description, 'lxml').get_text(separator=' ').strip()
+            self.ai_processor.queue_analysis(job_id, text_description)
             return True
+
+        self.stats['failed'] += 1
         return False
+
+    def _fetch_with_retry(self, job_id) -> Tuple[Optional[str], Optional[str], str]:
+        """Fetch a job description via GraphQL, retrying transient failures."""
+        status = 'request_error'
+        for attempt in range(self.config.max_job_retries + 1):
+            description, suburb, status = fetch_job_detail(
+                job_id,
+                timeout=self.config.request_timeout,
+                session=self.session,
+                logger=self.logger,
+            )
+
+            if status not in TRANSIENT_STATUSES:
+                return description, suburb, status
+
+            # Transient: back off and retry.
+            if attempt < self.config.max_job_retries:
+                backoff = self.config.delay * (attempt + 1)
+                self.logger.warning(
+                    f"  Transient failure ({status}) for job {job_id}, "
+                    f"retry {attempt + 1}/{self.config.max_job_retries} after {backoff:.1f}s"
+                )
+                time.sleep(backoff)
+
+        return None, None, status
 
     def _update_job(self, job_id: int, description: str, suburb: str = None) -> bool:
         """Update job description in database (thread-safe)"""
@@ -490,8 +297,7 @@ class JobDescriptionBackfiller:
         self.logger.info(f"Total jobs processed: {self.stats['total']}")
         self.logger.info(f"Successfully updated: {self.stats['success']}")
         self.logger.info(f"Failed: {self.stats['failed']}")
-        self.logger.info(f"Cloudflare blocked: {self.stats['cloudflare_blocked']}")
-        self.logger.info(f"Driver restarts: {self.stats['driver_restarts']}")
+        self.logger.info(f"No description available: {self.stats['no_description']}")
         self.logger.info(f"Success rate: {self.stats['success']/max(self.stats['total'],1)*100:.1f}%")
 
         if self.config.enable_async_ai:

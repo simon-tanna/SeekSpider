@@ -5,6 +5,8 @@ CLI entry point for backfill module.
 Usage:
     python -m backfill --region Sydney --limit 100
     python -m backfill --region-filter Melbourne --workers 3
+
+Job descriptions are fetched from Seek's GraphQL API (no browser required).
 """
 
 import argparse
@@ -70,7 +72,7 @@ def parse_args():
 Examples:
     python -m backfill --region Sydney --limit 100
     python -m backfill --region-filter Melbourne --workers 3
-    python -m backfill --headless --workers 1
+    python -m backfill --workers 1
         '''
     )
 
@@ -81,12 +83,6 @@ Examples:
                         help='Base delay between requests in seconds (default: 5.0)')
     parser.add_argument('--workers', type=int, default=3,
                         help='Number of concurrent workers (1-5, default: 3)')
-
-    # Browser options
-    parser.add_argument('--headless', action='store_true',
-                        help='Run browser in headless mode (default: False)')
-    parser.add_argument('--no-xvfb', action='store_true',
-                        help='Disable virtual display (Xvfb). By default Xvfb is enabled.')
 
     # Region options
     parser.add_argument('--region', type=str, default=None,
@@ -103,8 +99,6 @@ Examples:
     # Other options
     parser.add_argument('--include-inactive', action='store_true',
                         help='Include inactive jobs in backfill')
-    parser.add_argument('--restart-interval', type=int, default=30,
-                        help='Restart Chrome driver every N jobs (default: 30, serial mode only)')
 
     return parser.parse_args()
 
@@ -121,21 +115,17 @@ def main():
         delay=args.delay,
         workers=args.workers,
         limit=args.limit,
-        headless=args.headless,
-        use_xvfb=not args.no_xvfb,
         region_filter=args.region_filter,
         region=args.region,
         include_inactive=args.include_inactive,
         enable_async_ai=not args.no_async_ai,
         skip_ai_post=args.skip_ai,
-        restart_interval=args.restart_interval,
     )
 
-    logger.info(f"Arguments: limit={args.limit}, delay={args.delay}, headless={args.headless}, "
-                f"xvfb={not args.no_xvfb}, skip_ai={args.skip_ai}, no_async_ai={args.no_async_ai}, "
+    logger.info(f"Arguments: limit={args.limit}, delay={args.delay}, "
+                f"skip_ai={args.skip_ai}, no_async_ai={args.no_async_ai}, "
                 f"include_inactive={args.include_inactive}, region={args.region}, "
-                f"region_filter={args.region_filter}, restart_interval={args.restart_interval}, "
-                f"workers={args.workers}")
+                f"region_filter={args.region_filter}, workers={args.workers}")
 
     # Create and run backfiller
     backfiller = JobDescriptionBackfiller(config, logger)
