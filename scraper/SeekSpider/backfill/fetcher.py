@@ -72,9 +72,18 @@ def fetch_job_detail(
     except ValueError:
         return None, None, "invalid_json"
 
-    if body.get("errors"):
+    errors = body.get("errors")
+    if errors:
+        # Seek signals rate limiting as HTTP 200 with a RATE_LIMITED error in the
+        # body (not an HTTP 429), so treat that as transient/retryable.
+        if any(
+            (e.get("extensions") or {}).get("code") == "RATE_LIMITED"
+            or "too many requests" in str(e.get("message", "")).lower()
+            for e in errors
+        ):
+            return None, None, "rate_limited"
         if logger:
-            logger.warning(f"  GraphQL errors for job {job_id}: {body['errors']}")
+            logger.warning(f"  GraphQL errors for job {job_id}: {errors}")
         return None, None, "graphql_error"
 
     details = (body.get("data") or {}).get("jobDetails") or {}
