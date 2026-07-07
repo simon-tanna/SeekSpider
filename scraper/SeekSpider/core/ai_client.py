@@ -233,8 +233,7 @@ class AIClient:
                         }
                     ],
                     "stream": False,
-                    "response_format": {"type": "text"},
-                    "temperature": 1.3
+                    "temperature": 0.2
                 }
 
                 response = requests.post(
